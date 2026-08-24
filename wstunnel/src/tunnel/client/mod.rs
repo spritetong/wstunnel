@@ -5,5 +5,6 @@ mod config;
 pub mod l4_transport_stream;
 
 pub use client::WsClient;
+pub use cnx_pool::WsConnection;
 pub use config::TlsClientConfig;
 pub use config::WsClientConfig;

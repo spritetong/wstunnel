@@ -16,22 +16,8 @@ impl WsConnection {
     pub fn new(config: Arc<WsClientConfig>) -> Self {
         Self(config)
     }
-}
 
-impl Deref for WsConnection {
-    type Target = WsClientConfig;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ManageConnection for WsConnection {
-    type Connection = Option<TransportStream>;
-    type Error = anyhow::Error;
-
-    #[instrument(level = "trace", name = "cnx_server", skip_all)]
-    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+    pub async fn connect_fresh(&self) -> Result<TransportStream, anyhow::Error> {
         let timeout = self.timeout_connect;
 
         let tcp_stream = if let Some(http_proxy) = &self.http_proxy {
@@ -66,10 +52,28 @@ impl ManageConnection for WsConnection {
                     return Err(anyhow!("Timed out doing the TLS handshake with the server"));
                 }
             };
-            Ok(Some(TransportStream::from_client_tls(tls_stream, Bytes::default())))
+            Ok(TransportStream::from_client_tls(tls_stream, Bytes::default()))
         } else {
-            Ok(Some(TransportStream::from_tcp(tcp_stream, Bytes::default())))
+            Ok(TransportStream::from_tcp(tcp_stream, Bytes::default()))
         }
+    }
+}
+
+impl Deref for WsConnection {
+    type Target = WsClientConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ManageConnection for WsConnection {
+    type Connection = Option<TransportStream>;
+    type Error = anyhow::Error;
+
+    #[instrument(level = "trace", name = "cnx_server", skip_all)]
+    async fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        self.connect_fresh().await.map(Some)
     }
 
     async fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {

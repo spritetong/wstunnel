@@ -268,17 +268,11 @@ impl TunnelRead for WebsocketTunnelRead {
     }
 }
 
-pub async fn connect(
+fn build_upgrade_request(
     request_id: Uuid,
-    client: &WsClient<impl crate::TokioExecutorRef>,
+    client_cfg: &crate::tunnel::client::WsClientConfig,
     dest_addr: &RemoteAddr,
-) -> anyhow::Result<(WebsocketTunnelRead, WebsocketTunnelWrite, Parts)> {
-    let client_cfg = &client.config;
-    let mut pooled_cnx = match client.cnx_pool.get().await {
-        Ok(cnx) => Ok(cnx),
-        Err(err) => Err(anyhow!("failed to get a connection to the server from the pool: {err:?}")),
-    }?;
-
+) -> anyhow::Result<Request<Empty<Bytes>>> {
     let mut req = Request::builder()
         .method("GET")
         .uri(format!("/{}/events", client_cfg.http_upgrade_path_prefix))
@@ -325,17 +319,55 @@ pub async fn connect(
         }
     }
 
-    let req = req.body(Empty::<Bytes>::new()).with_context(|| {
+    req.body(Empty::<Bytes>::new()).with_context(|| {
         format!(
             "failed to build HTTP request to contact the server {:?}",
             client_cfg.remote_addr
         )
-    })?;
+    })
+}
+
+pub async fn connect(
+    request_id: Uuid,
+    client: &WsClient<impl crate::TokioExecutorRef>,
+    dest_addr: &RemoteAddr,
+) -> anyhow::Result<(WebsocketTunnelRead, WebsocketTunnelWrite, Parts)> {
+    let client_cfg = &client.config;
+    let mut pooled_cnx = match client.cnx_pool.get().await {
+        Ok(cnx) => Ok(cnx),
+        Err(err) => Err(anyhow!("failed to get a connection to the server from the pool: {err:?}")),
+    }?;
+
+    let req = build_upgrade_request(request_id, client_cfg, dest_addr)?;
     debug!("with HTTP upgrade request {req:?}");
     let transport = pooled_cnx.deref_mut().take().unwrap();
-    let (ws, response) = fastwebsockets::handshake::client(&TokioExecutor::new(), req, transport)
-        .await
-        .with_context(|| format!("failed to do websocket handshake with the server {:?}", client_cfg.remote_addr))?;
+    let handshake_res = fastwebsockets::handshake::client(&TokioExecutor::new(), req, transport).await;
+
+    let (ws, response) = match handshake_res {
+        Ok(res) => res,
+        Err(err) => {
+            log::warn!("Websocket handshake on pooled connection failed ({err:?}), retrying with fresh connection...");
+            let fresh_transport = crate::tunnel::client::WsConnection::new(client_cfg.clone())
+                .connect_fresh()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to establish fresh connection after pool handshake failure {:?}",
+                        client_cfg.remote_addr
+                    )
+                })?;
+
+            let req = build_upgrade_request(request_id, client_cfg, dest_addr)?;
+            fastwebsockets::handshake::client(&TokioExecutor::new(), req, fresh_transport)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to do websocket handshake with fresh connection to server {:?}",
+                        client_cfg.remote_addr
+                    )
+                })?
+        }
+    };
 
     let (ws_rx, ws_tx) = mk_websocket_tunnel(ws, Role::Client, client_cfg.websocket_mask_frame)?;
     Ok((ws_rx, ws_tx, response.into_parts().0))

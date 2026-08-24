@@ -203,15 +203,42 @@ pub async fn connect(
     })?;
     debug!("with HTTP upgrade request {req:?}");
     let transport = pooled_cnx.deref_mut().take().unwrap();
-    let (mut request_sender, cnx) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+    let handshake_res = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .timer(TokioTimer::new())
         .adaptive_window(true)
         .keep_alive_interval(client.config.websocket_ping_frequency)
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(false)
         .handshake(TokioIo::new(transport))
-        .await
-        .with_context(|| format!("failed to do http2 handshake with the server {:?}", client.config.remote_addr))?;
+        .await;
+
+    let (mut request_sender, cnx) = match handshake_res {
+        Ok(res) => res,
+        Err(err) => {
+            warn!("HTTP/2 handshake on pooled connection failed ({err:?}), retrying with fresh connection...");
+            let fresh_transport = crate::tunnel::client::WsConnection::new(client.config.clone())
+                .connect_fresh()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to establish fresh connection after pool handshake failure {:?}",
+                        client.config.remote_addr
+                    )
+                })?;
+
+            hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .timer(TokioTimer::new())
+                .adaptive_window(true)
+                .keep_alive_interval(client.config.websocket_ping_frequency)
+                .keep_alive_timeout(Duration::from_secs(10))
+                .keep_alive_while_idle(false)
+                .handshake(TokioIo::new(fresh_transport))
+                .await
+                .with_context(|| {
+                    format!("failed to do http2 handshake with the server {:?}", client.config.remote_addr)
+                })?
+        }
+    };
     let cnx_poller = client.executor.spawn(async move {
         if let Err(err) = cnx.await {
             error!("{err:?}")
