@@ -117,11 +117,19 @@ impl TunnelWrite for WebsocketTunnelWrite {
             return Err(io::Error::new(ErrorKind::BrokenPipe, err));
         }
 
+        if let Err(err) = self.inner.flush().await {
+            return Err(io::Error::new(ErrorKind::BrokenPipe, err));
+        }
+
         Ok(())
     }
 
     async fn close(&mut self) -> Result<(), io::Error> {
         if let Err(err) = self.inner.write_frame(Frame::close(1000, &[])).await {
+            return Err(io::Error::new(ErrorKind::BrokenPipe, err));
+        }
+
+        if let Err(err) = self.inner.flush().await {
             return Err(io::Error::new(ErrorKind::BrokenPipe, err));
         }
 
@@ -133,6 +141,7 @@ impl TunnelWrite for WebsocketTunnelWrite {
     }
 
     async fn handle_pending_operations(&mut self) -> Result<(), io::Error> {
+        let mut need_flush = false;
         while let Ok(frame) = self.pending_operations.try_recv() {
             debug!("received frame {:?}", frame.opcode);
             match frame.opcode {
@@ -140,18 +149,26 @@ impl TunnelWrite for WebsocketTunnelWrite {
                     if self.inner.write_frame(frame).await.is_err() {
                         return Err(io::Error::new(ErrorKind::ConnectionAborted, "cannot send close frame"));
                     }
+                    need_flush = true;
                 }
                 OpCode::Ping => {
                     debug!("sending pong frame");
                     if self.inner.write_frame(Frame::pong(frame.payload)).await.is_err() {
                         return Err(io::Error::new(ErrorKind::ConnectionAborted, "cannot send pong frame"));
                     }
+                    need_flush = true;
                 }
                 OpCode::Pong => {
                     debug!("received pong frame");
                     self.in_flight_ping.store(0, Relaxed);
                 }
                 OpCode::Continuation | OpCode::Text | OpCode::Binary => unreachable!(),
+            }
+        }
+
+        if need_flush {
+            if let Err(err) = self.inner.flush().await {
+                return Err(io::Error::new(ErrorKind::ConnectionAborted, err));
             }
         }
 
